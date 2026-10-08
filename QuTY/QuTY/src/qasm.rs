@@ -1,4 +1,4 @@
-use crate::physical_specs::PhysicalTransmonSpec;
+use crate::physical_specs::{PhysicalIonTrapSpec, PhysicalTransmonSpec};
 use num_complex::Complex64;
 use rand::Rng;
 use std::collections::HashMap;
@@ -90,6 +90,92 @@ impl QasmProgram {
 
         for _ in 0..shots {
             let mut val = if rng.gen::<f64>() >= decoherence_rate {
+                let r: f64 = rng.gen();
+                let mut chosen = 0;
+                for (idx, &cp) in cum_probs.iter().enumerate() {
+                    if r <= cp {
+                        chosen = idx;
+                        break;
+                    }
+                }
+                chosen
+            } else {
+                rng.gen_range(0..dim)
+            };
+
+            for q in 0..self.num_qubits {
+                let bit = (val >> q) & 1;
+                if bit == 0 {
+                    if rng.gen::<f64>() < spec.readout_p01 {
+                        val ^= 1 << q;
+                    }
+                } else if rng.gen::<f64>() < spec.readout_p10 {
+                    val ^= 1 << q;
+                }
+            }
+
+            let bitstring = format!("{:0width$b}", val, width = self.num_qubits);
+            *results.entry(bitstring).or_insert(0) += 1;
+        }
+
+        results
+    }
+
+    pub fn run_noisy_simulation_ion(
+        &self,
+        spec: &PhysicalIonTrapSpec,
+        shots: usize,
+    ) -> HashMap<String, usize> {
+        let mut results = HashMap::new();
+        if shots == 0 {
+            return results;
+        }
+
+        let ideal_state = self.simulate_ideal();
+        let dim = 1 << self.num_qubits;
+        let mut probs: Vec<f64> = ideal_state.iter().map(|c| c.norm_sqr()).collect();
+
+        let total_prob: f64 = probs.iter().sum();
+        if total_prob > 0.0 {
+            for p in &mut probs {
+                *p /= total_prob;
+            }
+        } else if dim > 0 {
+            probs[0] = 1.0;
+        }
+
+        let mut n_1q = 0;
+        let mut n_2q = 0;
+        for inst in &self.instructions {
+            let cl = inst.trim();
+            if cl.starts_with("cx ") || cl.starts_with("cnot ") || cl.starts_with("cz ") || cl.swap_check() {
+                n_2q += 1;
+            } else if !cl.starts_with("measure ") {
+                n_1q += 1;
+            }
+        }
+
+        let t_total_s = (n_1q as f64 * spec.gate_time_1q_us + n_2q as f64 * spec.gate_time_2q_us) * 1e-6;
+        let dephasing_err = (t_total_s / spec.t2_s).clamp(0.0, 0.40);
+
+        let t_2q_s = (n_2q as f64 * spec.gate_time_2q_us) * 1e-6;
+        let delta_n = spec.heating_rate_quanta_s * t_2q_s;
+        let motional_err = (delta_n * 0.08).clamp(0.0, 0.30);
+
+        let scatter_err = ((n_1q as f64 + 2.0 * n_2q as f64) * spec.raman_scattering_prob).clamp(0.0, 0.20);
+        let total_ion_err = (dephasing_err + motional_err + scatter_err).clamp(0.0005, 0.45);
+
+        let mut cum_probs = Vec::with_capacity(dim);
+        let mut acc = 0.0;
+        for &p in &probs {
+            acc += p;
+            cum_probs.push(acc);
+        }
+
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..shots {
+            let mut val = if rng.gen::<f64>() >= total_ion_err {
                 let r: f64 = rng.gen();
                 let mut chosen = 0;
                 for (idx, &cp) in cum_probs.iter().enumerate() {
@@ -286,5 +372,15 @@ impl QasmProgram {
         let start = token.find('[')?;
         let end = token.find(']')?;
         token[start + 1..end].trim().parse::<usize>().ok()
+    }
+}
+
+trait StrExt {
+    fn swap_check(&self) -> bool;
+}
+
+impl StrExt for str {
+    fn swap_check(&self) -> bool {
+        self.starts_with("swap ")
     }
 }

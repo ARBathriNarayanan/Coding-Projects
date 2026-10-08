@@ -57,6 +57,27 @@ pub struct GridCell {
     pub param: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AlgorithmPreset {
+    Ghz3Qubit,
+    BellState,
+    Grover2Qubit,
+    DeutschJozsaBalanced,
+    QuantumTeleportation,
+}
+
+impl AlgorithmPreset {
+    pub fn name(&self) -> &'static str {
+        match self {
+            AlgorithmPreset::Ghz3Qubit => "3-Qubit GHZ Entanglement (|000> + |111>)",
+            AlgorithmPreset::BellState => "2-Qubit Bell State Φ+ (|00> + |11>)",
+            AlgorithmPreset::Grover2Qubit => "Grover's Search 2-Qubit (Marked |11>)",
+            AlgorithmPreset::DeutschJozsaBalanced => "Deutsch-Jozsa (Balanced Oracle f(x)=x)",
+            AlgorithmPreset::QuantumTeleportation => "Quantum Teleportation (Alice -> Bob)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CircuitGrid {
     pub num_qubits: usize,
@@ -66,23 +87,7 @@ pub struct CircuitGrid {
 
 impl Default for CircuitGrid {
     fn default() -> Self {
-        let mut grid = Self {
-            num_qubits: 3,
-            num_steps: 6,
-            grid: vec![vec![GridCell::default(); 6]; 3],
-        };
-
-        grid.grid[0][0].gate = Some(GateType::H);
-        grid.grid[1][1].gate = Some(GateType::Cnot);
-        grid.grid[1][1].control_qubit = Some(0);
-        grid.grid[2][2].gate = Some(GateType::Cnot);
-        grid.grid[2][2].control_qubit = Some(1);
-
-        for q in 0..3 {
-            grid.grid[q][5].gate = Some(GateType::Measure);
-        }
-
-        grid
+        Self::from_preset(AlgorithmPreset::Ghz3Qubit)
     }
 }
 
@@ -100,6 +105,131 @@ impl std::ops::IndexMut<usize> for CircuitGrid {
 }
 
 impl CircuitGrid {
+    pub fn from_preset(preset: AlgorithmPreset) -> Self {
+        match preset {
+            AlgorithmPreset::Ghz3Qubit => {
+                let num_qubits = 3;
+                let num_steps = 5;
+                let mut grid = vec![vec![GridCell::default(); num_steps]; num_qubits];
+
+                grid[0][0].gate = Some(GateType::H);
+
+                grid[1][1].gate = Some(GateType::Cnot);
+                grid[1][1].control_qubit = Some(0);
+
+                grid[2][2].gate = Some(GateType::Cnot);
+                grid[2][2].control_qubit = Some(1);
+
+                for q in 0..3 {
+                    grid[q][3].gate = Some(GateType::Measure);
+                }
+
+                Self { num_qubits, num_steps, grid }
+            }
+            AlgorithmPreset::BellState => {
+                let num_qubits = 2;
+                let num_steps = 4;
+                let mut grid = vec![vec![GridCell::default(); num_steps]; num_qubits];
+
+                grid[0][0].gate = Some(GateType::H);
+
+                grid[1][1].gate = Some(GateType::Cnot);
+                grid[1][1].control_qubit = Some(0);
+
+                grid[0][2].gate = Some(GateType::Measure);
+                grid[1][2].gate = Some(GateType::Measure);
+
+                Self { num_qubits, num_steps, grid }
+            }
+            AlgorithmPreset::Grover2Qubit => {
+                let num_qubits = 2;
+                let num_steps = 9;
+                let mut grid = vec![vec![GridCell::default(); num_steps]; num_qubits];
+
+                // 1. Equal Superposition
+                grid[0][0].gate = Some(GateType::H);
+                grid[1][0].gate = Some(GateType::H);
+
+                // 2. Oracle for |11>: CZ gate marks |11> with -1 phase
+                grid[1][1].gate = Some(GateType::Cz);
+                grid[1][1].control_qubit = Some(0);
+
+                // 3. Diffusion operator: H -> X -> CZ -> X -> H
+                grid[0][2].gate = Some(GateType::H);
+                grid[1][2].gate = Some(GateType::H);
+
+                grid[0][3].gate = Some(GateType::X);
+                grid[1][3].gate = Some(GateType::X);
+
+                grid[1][4].gate = Some(GateType::Cz);
+                grid[1][4].control_qubit = Some(0);
+
+                grid[0][5].gate = Some(GateType::X);
+                grid[1][5].gate = Some(GateType::X);
+
+                grid[0][6].gate = Some(GateType::H);
+                grid[1][6].gate = Some(GateType::H);
+
+                // 4. Measure
+                grid[0][7].gate = Some(GateType::Measure);
+                grid[1][7].gate = Some(GateType::Measure);
+
+                Self { num_qubits, num_steps, grid }
+            }
+            AlgorithmPreset::DeutschJozsaBalanced => {
+                let num_qubits = 2;
+                let num_steps = 6;
+                let mut grid = vec![vec![GridCell::default(); num_steps]; num_qubits];
+
+                // Ancilla q[1] initialized to |1>
+                grid[1][0].gate = Some(GateType::X);
+
+                // Superposition on input and ancilla (|->)
+                grid[0][1].gate = Some(GateType::H);
+                grid[1][1].gate = Some(GateType::H);
+
+                // Balanced oracle f(x) = x -> CNOT(0 -> 1)
+                grid[1][2].gate = Some(GateType::Cnot);
+                grid[1][2].control_qubit = Some(0);
+
+                // Interference on input
+                grid[0][3].gate = Some(GateType::H);
+
+                // Measurement: input q[0] gives |1> indicating balanced!
+                grid[0][4].gate = Some(GateType::Measure);
+                grid[1][4].gate = Some(GateType::Measure);
+
+                Self { num_qubits, num_steps, grid }
+            }
+            AlgorithmPreset::QuantumTeleportation => {
+                let num_qubits = 3;
+                let num_steps = 7;
+                let mut grid = vec![vec![GridCell::default(); num_steps]; num_qubits];
+
+                // Prepare state on q[0] to teleport (|+)
+                grid[0][0].gate = Some(GateType::H);
+
+                // Entangle Bell pair between Alice q[1] and Bob q[2]
+                grid[1][1].gate = Some(GateType::H);
+                grid[2][2].gate = Some(GateType::Cnot);
+                grid[2][2].control_qubit = Some(1);
+
+                // Alice Bell measurement: CNOT(q0 -> q1), H(q0)
+                grid[1][3].gate = Some(GateType::Cnot);
+                grid[1][3].control_qubit = Some(0);
+
+                grid[0][4].gate = Some(GateType::H);
+
+                // Measurement
+                for q in 0..3 {
+                    grid[q][5].gate = Some(GateType::Measure);
+                }
+
+                Self { num_qubits, num_steps, grid }
+            }
+        }
+    }
+
     pub fn add_qubit(&mut self) {
         if self.num_qubits < 8 {
             self.num_qubits += 1;
@@ -170,7 +300,7 @@ impl CircuitGrid {
                         }
                         GateType::Swap => {
                             let partner = cell.control_qubit.unwrap_or(if q > 0 { q - 1 } else { 1 });
-                            if partner < self.num_qubits && partner != q && q < partner {
+                            if partner < self.num_qubits && q < partner {
                                 qasm.push_str(&format!("swap q[{}],q[{}];\n", q, partner));
                             }
                         }
@@ -212,7 +342,6 @@ impl CircuitGrid {
                 continue;
             }
 
-            // 1-Qubit standard gates
             let single_op = if line.starts_with("h ") {
                 Some((GateType::H, &line[2..]))
             } else if line.starts_with("x ") {
@@ -238,7 +367,6 @@ impl CircuitGrid {
                 continue;
             }
 
-            // Parameterized rotations: rx, ry, rz
             let mut is_rot = false;
             for (prefix, gate) in [("rx(", GateType::Rx), ("ry(", GateType::Ry), ("rz(", GateType::Rz)] {
                 if line.starts_with(prefix) {
@@ -258,7 +386,6 @@ impl CircuitGrid {
                 continue;
             }
 
-            // Multi-qubit gates: cx, cz, swap
             let two_q = if line.starts_with("cx ") {
                 Some((GateType::Cnot, &line[3..]))
             } else if line.starts_with("cnot ") {
@@ -320,16 +447,11 @@ impl CircuitGrid {
                 denom.parse::<f64>().map(|d| -pi / d).unwrap_or(-pi)
             } else if s.contains("*pi/") {
                 let parts: Vec<&str> = s.split("*pi/").collect();
-                if parts.len() == 2 {
-                    let num = parts[0].parse::<f64>().unwrap_or(1.0);
-                    let den = parts[1].parse::<f64>().unwrap_or(1.0);
-                    (num * pi) / den
-                } else {
-                    pi
-                }
+                let num = parts.get(0).and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                let den = parts.get(1).and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+                (num * pi) / den
             } else if s.contains("*pi") {
-                let num = s.replace("*pi", "").parse::<f64>().unwrap_or(1.0);
-                num * pi
+                s.replace("*pi", "").parse::<f64>().unwrap_or(1.0) * pi
             } else {
                 pi
             }

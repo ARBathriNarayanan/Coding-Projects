@@ -1,11 +1,13 @@
 use eframe::egui::{self, Color32, Pos2, Stroke, Vec2};
 use std::collections::HashMap;
 
-use crate::circuit_grid::{CircuitGrid, GateType, GridCell};
+use crate::circuit_grid::{AlgorithmPreset, CircuitGrid, GateType, GridCell};
 use crate::emitters::{
     EmitterErrorEstimator, OpticsHbtHom, PurcellCavitySpec, SiliconDefect,
 };
-use crate::physical_specs::PhysicalTransmonSpec;
+use crate::physical_specs::{
+    HardwarePlatform, IonSpecies, PhysicalIonTrapSpec, PhysicalTransmonSpec,
+};
 use crate::postprocessing::{
     CustomSyndromeRule, DecodeMode, Postprocessor, QECCodeConfig, QECCodePreset,
 };
@@ -28,9 +30,14 @@ pub enum PostprocessProtocol {
 pub struct TransmonApp {
     pub mode: AppMode,
 
-    // --- Transmon State ---
+    // --- Hardware Platform & Physics Specs ---
+    pub hardware_platform: HardwarePlatform,
     pub spec: PhysicalTransmonSpec,
+    pub ion_spec: PhysicalIonTrapSpec,
+
+    // --- Circuit & Simulation State ---
     pub grid: CircuitGrid,
+    pub selected_preset: Option<AlgorithmPreset>,
     pub selected_gate: Option<GateType>,
     pub selected_cnot_control: usize,
     pub selected_angle: f64,
@@ -70,9 +77,14 @@ impl Default for TransmonApp {
         let mut app = Self {
             mode: AppMode::TransmonQubits,
 
-            // Transmon defaults
+            // Hardware & Specs
+            hardware_platform: HardwarePlatform::SuperconductingTransmon,
             spec: PhysicalTransmonSpec::default(),
+            ion_spec: PhysicalIonTrapSpec::ionq_aria1(),
+
+            // Circuit Defaults
             grid,
+            selected_preset: Some(AlgorithmPreset::Ghz3Qubit),
             selected_gate: Some(GateType::H),
             selected_cnot_control: 0,
             selected_angle: std::f64::consts::FRAC_PI_2,
@@ -81,7 +93,7 @@ impl Default for TransmonApp {
             simulation_results: None,
             transmon_error_msg: None,
 
-            // Emitter defaults
+            // Emitter Defaults
             selected_defect: SiliconDefect::GCenter,
             cavity_q: 10000.0,
             mode_volume_lambda3: 0.80,
@@ -90,7 +102,7 @@ impl Default for TransmonApp {
             detuning_ghz: 0.0,
             spin_bath_noise_mhz: 0.20,
 
-            // Postprocessing & QEC defaults
+            // Postprocessing Defaults
             postprocessing_protocol: PostprocessProtocol::QecStabilizer,
             qec_config,
             custom_python_script,
@@ -116,7 +128,14 @@ impl TransmonApp {
         self.transmon_error_msg = None;
         match QasmProgram::from_str(&self.qasm_text) {
             Ok(program) => {
-                let results = program.run_noisy_simulation(&self.spec, self.shots);
+                let results = match self.hardware_platform {
+                    HardwarePlatform::SuperconductingTransmon => {
+                        program.run_noisy_simulation(&self.spec, self.shots)
+                    }
+                    HardwarePlatform::TrappedIon => {
+                        program.run_noisy_simulation_ion(&self.ion_spec, self.shots)
+                    }
+                };
                 self.simulation_results = Some(results);
             }
             Err(err) => {
@@ -127,90 +146,199 @@ impl TransmonApp {
     }
 
     // =========================================================================
-    // WORKSPACE 1: SUPERCONDUCTING TRANSMONS
+    // WORKSPACE 1: QUANTUM HARDWARE & CIRCUIT SIMULATION
     // =========================================================================
     fn render_transmon_mode(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("transmon_controls")
-            .default_width(300.0)
-            .min_width(240.0)
+        egui::SidePanel::left("hardware_controls")
+            .default_width(310.0)
+            .min_width(250.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("Physical Transmon Specs");
+                ui.heading("Quantum Hardware Console");
+                ui.add_space(4.0);
+
+                // Hardware Platform Selector: Transmon vs. Trapped Ion
+                ui.horizontal(|ui| {
+                    let transmon_btn = ui.selectable_label(
+                        self.hardware_platform == HardwarePlatform::SuperconductingTransmon,
+                        "⚛ Transmon",
+                    );
+                    if transmon_btn.clicked() {
+                        self.hardware_platform = HardwarePlatform::SuperconductingTransmon;
+                        self.run_transmon_simulation();
+                    }
+
+                    let ion_btn = ui.selectable_label(
+                        self.hardware_platform == HardwarePlatform::TrappedIon,
+                        "⚡ Trapped Ion",
+                    );
+                    if ion_btn.clicked() {
+                        self.hardware_platform = HardwarePlatform::TrappedIon;
+                        self.run_transmon_simulation();
+                    }
+                });
                 ui.separator();
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Josephson & Charging Energies").strong());
-                        ui.add(egui::Slider::new(&mut self.spec.josephson_energy_ej, 5.0..=35.0).text("E_J (GHz)"));
-                        ui.add(egui::Slider::new(&mut self.spec.charging_energy_ec, 0.10..=0.50).text("E_C (GHz)"));
+                    match self.hardware_platform {
+                        HardwarePlatform::SuperconductingTransmon => {
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Transmon Physical Parameters").strong().color(Color32::LIGHT_BLUE));
+                                ui.add(egui::Slider::new(&mut self.spec.josephson_energy_ej, 5.0..=35.0).text("E_J (GHz)"));
+                                ui.add(egui::Slider::new(&mut self.spec.charging_energy_ec, 0.10..=0.50).text("E_C (GHz)"));
 
-                        let freq = self.spec.qubit_frequency_ghz();
-                        let ratio = self.spec.ej_ec_ratio();
-                        ui.label(format!("Transmon Freq f_01 : {:.2} GHz", freq));
-                        ui.label(format!("E_J / E_C Ratio   : {:.1}", ratio));
-                        if ratio < 20.0 {
-                            ui.colored_label(Color32::KHAKI, "Warning: Low E_J/E_C (<20) increases charge noise.");
+                                let freq = self.spec.qubit_frequency_ghz();
+                                let ratio = self.spec.ej_ec_ratio();
+                                ui.label(format!("Transmon Freq f_01 : {:.2} GHz", freq));
+                                ui.label(format!("E_J / E_C Ratio   : {:.1}", ratio));
+                                ui.label(format!("Anharmonicity α   : {:.2} GHz", self.spec.anharmonicity_ghz()));
+                                if ratio < 20.0 {
+                                    ui.colored_label(Color32::KHAKI, "Warning: Low E_J/E_C (<20) increases charge noise.");
+                                }
+                            });
+
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Decoherence & Relaxation Times").strong());
+                                ui.add(egui::Slider::new(&mut self.spec.t1_us, 1.0..=300.0).text("T_1 Decay (us)"));
+                                ui.add(egui::Slider::new(&mut self.spec.t2_us, 1.0..=300.0).text("T_2 Dephasing (us)"));
+                            });
+
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Readout Confusion Matrix").strong());
+                                ui.add(egui::Slider::new(&mut self.spec.readout_p01, 0.0..=0.15).text("P(1|0) False Positive"));
+                                ui.add(egui::Slider::new(&mut self.spec.readout_p10, 0.0..=0.15).text("P(0|1) False Negative"));
+                            });
+
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Transmon Presets").strong());
+                                ui.horizontal(|ui| {
+                                    if ui.button("IBM Eagle").clicked() {
+                                        self.spec = PhysicalTransmonSpec {
+                                            josephson_energy_ej: 18.0,
+                                            charging_energy_ec: 0.28,
+                                            t1_us: 120.0,
+                                            t2_us: 80.0,
+                                            readout_p01: 0.012,
+                                            readout_p10: 0.018,
+                                            flux_noise_amplitude: 1e-4,
+                                            thermal_population_nth: 0.01,
+                                            gate_time_1q_us: 0.02,
+                                            gate_time_2q_us: 0.05,
+                                        };
+                                        self.run_transmon_simulation();
+                                    }
+                                    if ui.button("High Noise").clicked() {
+                                        self.spec = PhysicalTransmonSpec {
+                                            josephson_energy_ej: 12.0,
+                                            charging_energy_ec: 0.35,
+                                            t1_us: 15.0,
+                                            t2_us: 10.0,
+                                            readout_p01: 0.06,
+                                            readout_p10: 0.08,
+                                            flux_noise_amplitude: 5e-4,
+                                            thermal_population_nth: 0.04,
+                                            gate_time_1q_us: 0.02,
+                                            gate_time_2q_us: 0.05,
+                                        };
+                                        self.run_transmon_simulation();
+                                    }
+                                });
+                            });
                         }
-                    });
+                        HardwarePlatform::TrappedIon => {
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Trapped-Ion Architecture").strong().color(Color32::from_rgb(241, 196, 15)));
+                                ui.label(format!("Natural Atomic T_1: {:.1} s", self.ion_spec.species.natural_t1_s()));
+                                egui::ComboBox::from_label("Species")
+                                    .selected_text(self.ion_spec.species.name())
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.ion_spec.species, IonSpecies::Yb171, "171Yb+ (Clock, 12.6 GHz)");
+                                        ui.selectable_value(&mut self.ion_spec.species, IonSpecies::Ca40, "40Ca+ (Optical, 729 nm)");
+                                        ui.selectable_value(&mut self.ion_spec.species, IonSpecies::Ba133, "133Ba+ (Visible, 1.7 GHz)");
+                                    });
+
+                                ui.colored_label(Color32::from_rgb(46, 204, 113), "⚡ Native All-to-All Coulomb Crystal Bus Active");
+                            });
+
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Secular Trapping & Phonon Noise").strong());
+                                ui.add(egui::Slider::new(&mut self.ion_spec.secular_freq_radial_mhz, 0.5..=5.0).text("Radial Freq (MHz)"));
+                                ui.add(egui::Slider::new(&mut self.ion_spec.heating_rate_quanta_s, 0.1..=200.0).logarithmic(true).text("Motional Heating dn/dt (quanta/s)"));
+                                ui.add(egui::Slider::new(&mut self.ion_spec.t2_s, 0.01..=10.0).logarithmic(true).text("T_2 Coherence (s)"));
+                            });
+
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Raman Gate Durations & Optical Errors").strong());
+                                ui.add(egui::Slider::new(&mut self.ion_spec.gate_time_2q_us, 50.0..=400.0).text("MS Gate 2Q (us)"));
+                                ui.add(egui::Slider::new(&mut self.ion_spec.raman_scattering_prob, 0.0001..=0.005).logarithmic(true).text("Raman Scatter Err"));
+                                ui.add(egui::Slider::new(&mut self.ion_spec.readout_p01, 0.001..=0.05).text("Fluorescence P(1|0)"));
+                                ui.add(egui::Slider::new(&mut self.ion_spec.readout_p10, 0.001..=0.05).text("Fluorescence P(0|1)"));
+                            });
+
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new("Ion Trap Presets").strong());
+                                ui.horizontal(|ui| {
+                                    if ui.button("IonQ Aria-1").clicked() {
+                                        self.ion_spec = PhysicalIonTrapSpec::ionq_aria1();
+                                        self.run_transmon_simulation();
+                                    }
+                                    if ui.button("Optical Ca-40").clicked() {
+                                        self.ion_spec = PhysicalIonTrapSpec::optical_ca40();
+                                        self.run_transmon_simulation();
+                                    }
+                                    if ui.button("High Noise").clicked() {
+                                        self.ion_spec = PhysicalIonTrapSpec::high_noise_surface();
+                                        self.run_transmon_simulation();
+                                    }
+                                });
+                            });
+                        }
+                    }
 
                     ui.add_space(8.0);
                     ui.group(|ui| {
-                        ui.label(egui::RichText::new("Decoherence & Relaxation Times").strong());
-                        ui.add(egui::Slider::new(&mut self.spec.t1_us, 1.0..=300.0).text("T_1 Decay (us)"));
-                        ui.add(egui::Slider::new(&mut self.spec.t2_us, 1.0..=300.0).text("T_2 Dephasing (us)"));
-                    });
-
-                    ui.add_space(8.0);
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Readout Confusion Matrix").strong());
-                        ui.add(egui::Slider::new(&mut self.spec.readout_p01, 0.0..=0.15).text("P(1|0) False Positive"));
-                        ui.add(egui::Slider::new(&mut self.spec.readout_p10, 0.0..=0.15).text("P(0|1) False Negative"));
-                    });
-
-                    ui.add_space(8.0);
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Shots & Preset Configs").strong());
+                        ui.label(egui::RichText::new("Execution Shots").strong());
                         ui.add(egui::Slider::new(&mut self.shots, 128..=8192).text("Shots"));
-                        ui.horizontal(|ui| {
-                            if ui.button("IBM Eagle").clicked() {
-                                self.spec = PhysicalTransmonSpec {
-                                    josephson_energy_ej: 18.0,
-                                    charging_energy_ec: 0.28,
-                                    t1_us: 120.0,
-                                    t2_us: 80.0,
-                                    readout_p01: 0.012,
-                                    readout_p10: 0.018,
-                                    flux_noise_amplitude: 1e-4,
-                                    thermal_population_nth: 0.01,
-                                    gate_time_1q_us: 0.02,
-                                    gate_time_2q_us: 0.05,
-                                };
-                                self.run_transmon_simulation();
-                            }
-                            if ui.button("High Noise").clicked() {
-                                self.spec = PhysicalTransmonSpec {
-                                    josephson_energy_ej: 12.0,
-                                    charging_energy_ec: 0.35,
-                                    t1_us: 15.0,
-                                    t2_us: 10.0,
-                                    readout_p01: 0.06,
-                                    readout_p10: 0.08,
-                                    flux_noise_amplitude: 5e-4,
-                                    thermal_population_nth: 0.04,
-                                    gate_time_1q_us: 0.02,
-                                    gate_time_2q_us: 0.05,
-                                };
-                                self.run_transmon_simulation();
-                            }
-                        });
                     });
                 });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Interactive Circuit Composer & OpenQASM 2.0");
+            // Preset Algorithm Toolbar (Phase 1 P0)
+            ui.horizontal(|ui| {
+                ui.heading("Circuit Composer");
+                ui.separator();
+                ui.label(egui::RichText::new("📚 Preset Algorithms:").strong().color(Color32::from_rgb(241, 196, 15)));
+
+                let current_name = self.selected_preset.map(|p| p.name()).unwrap_or("Custom Circuit");
+                egui::ComboBox::from_id_source("preset_algo_dropdown")
+                    .selected_text(current_name)
+                    .show_ui(ui, |ui| {
+                        let presets = [
+                            AlgorithmPreset::Ghz3Qubit,
+                            AlgorithmPreset::BellState,
+                            AlgorithmPreset::Grover2Qubit,
+                            AlgorithmPreset::DeutschJozsaBalanced,
+                            AlgorithmPreset::QuantumTeleportation,
+                        ];
+                        for p in presets {
+                            if ui.selectable_label(self.selected_preset == Some(p), p.name()).clicked() {
+                                self.selected_preset = Some(p);
+                                self.grid = CircuitGrid::from_preset(p);
+                                self.sync_from_grid();
+                            }
+                        }
+                    });
+            });
             ui.separator();
 
+            // Gate Palette Toolbar
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Gate Palette:").strong());
                 let gates = [
@@ -287,10 +415,12 @@ impl TransmonApp {
                 ui.separator();
                 if ui.button("[+] Qubit").clicked() {
                     self.grid.add_qubit();
+                    self.selected_preset = None;
                     self.sync_from_grid();
                 }
                 if ui.button("[-] Qubit").clicked() {
                     self.grid.remove_qubit();
+                    self.selected_preset = None;
                     self.sync_from_grid();
                 }
                 if ui.button("[Run Grid]").clicked() {
@@ -304,13 +434,12 @@ impl TransmonApp {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Circuit Wire Grid").strong());
-                    ui.label("(Click on wire to place selected gate. For multi-qubit gates, select control/partner above)");
+                    ui.label("(Click on wire to place selected gate. Multi-qubit gates use control/partner above)");
                 });
                 for q in 0..self.grid.num_qubits {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("q[{}] --", q)).monospace().strong());
                         for s in 0..self.grid.num_steps {
-                            // Clone cell to prevent multiple borrow conflicts with self.grid
                             let cell = self.grid[q][s].clone();
 
                             let is_control_for = (0..self.grid.num_qubits).find(|&other_q| {
@@ -355,6 +484,7 @@ impl TransmonApp {
                                 )
                                 .clicked()
                             {
+                                self.selected_preset = None;
                                 if let Some(g) = self.selected_gate {
                                     match g {
                                         GateType::Rx | GateType::Ry | GateType::Rz => {
@@ -446,6 +576,7 @@ impl TransmonApp {
                         match CircuitGrid::from_qasm(&self.qasm_text) {
                             Ok(new_grid) => {
                                 self.grid = new_grid;
+                                self.selected_preset = None;
                                 self.run_transmon_simulation();
                             }
                             Err(e) => {
@@ -458,50 +589,73 @@ impl TransmonApp {
                     }
                 });
 
-                ui.label(
-                    egui::RichText::new(
-                        "You can type or paste arbitrary OpenQASM 2.0 code directly below. Click 'Run from QASM Text' to simulate!",
-                    )
-                    .small()
-                    .color(Color32::LIGHT_GRAY),
-                );
-
                 ui.add(
                     egui::TextEdit::multiline(&mut self.qasm_text)
                         .font(egui::TextStyle::Monospace)
-                        .desired_rows(8)
+                        .desired_rows(7)
                         .desired_width(f32::INFINITY),
                 );
             });
         });
 
+        // Right Panel: Visual Graphical Histogram (Phase 1 P0)
         egui::SidePanel::right("transmon_results")
-            .default_width(280.0)
-            .min_width(220.0)
+            .default_width(300.0)
+            .min_width(240.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("Noisy Simulation Results");
+                ui.heading("Hardware Shot Histogram");
                 ui.separator();
 
                 if let Some(err) = &self.transmon_error_msg {
                     ui.colored_label(Color32::LIGHT_RED, format!("Error: {}", err));
                 } else if let Some(counts) = &self.simulation_results {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("Platform: {}", self.hardware_platform.label())).strong());
+                    });
                     ui.label(format!("Total Shots Executed: {}", self.shots));
                     ui.add_space(8.0);
 
                     let mut sorted_keys: Vec<_> = counts.keys().collect();
                     sorted_keys.sort();
 
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("Shot Distribution").strong());
-                        for k in sorted_keys {
-                            let cnt = counts[k];
-                            let pct = (cnt as f64 / self.shots as f64) * 100.0;
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new(format!("|{}>", k)).monospace().strong());
-                                ui.label(format!("{:4} ({:.1}%)", cnt, pct));
-                            });
-                        }
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.group(|ui| {
+                            ui.label(egui::RichText::new("Measured State Distribution").strong());
+                            ui.add_space(4.0);
+
+                            for k in sorted_keys {
+                                let cnt = counts[k];
+                                let pct = (cnt as f64 / self.shots as f64) * 100.0;
+                                let frac = (cnt as f32 / self.shots as f32).clamp(0.0, 1.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("|{}>", k)).monospace().strong());
+
+                                    // Graphical color bar
+                                    let bar_color = if frac > 0.40 {
+                                        Color32::from_rgb(46, 204, 113) // Emerald Green for dominant peaks
+                                    } else if frac > 0.15 {
+                                        Color32::from_rgb(52, 152, 219) // Dodger Blue for superpositions
+                                    } else {
+                                        Color32::from_rgb(127, 140, 141) // Slate Gray for noise floor
+                                    };
+
+                                    let (rect, _response) = ui.allocate_exact_size(Vec2::new(100.0, 14.0), egui::Sense::hover());
+                                    let painter = ui.painter_at(rect);
+
+                                    // Background track
+                                    painter.rect_filled(rect, 2.0, Color32::from_rgb(30, 36, 48));
+
+                                    // Filled bar
+                                    let mut fill_rect = rect;
+                                    fill_rect.set_width((rect.width() * frac).max(1.0));
+                                    painter.rect_filled(fill_rect, 2.0, bar_color);
+
+                                    ui.label(egui::RichText::new(format!("{:4} ({:4.1}%)", cnt, pct)).monospace());
+                                });
+                            }
+                        });
                     });
                 }
             });
@@ -1059,12 +1213,12 @@ impl eframe::App for TransmonApp {
                 ui.selectable_value(
                     &mut self.mode,
                     AppMode::TransmonQubits,
-                    "⚛ Superconducting Transmons",
+                    "⚛ Hardware & Circuits",
                 );
                 ui.selectable_value(
                     &mut self.mode,
                     AppMode::QuantumEmitters,
-                    "🔬 Silicon Quantum Emitters",
+                    "🔬 Silicon Emitters",
                 );
                 ui.selectable_value(
                     &mut self.mode,
