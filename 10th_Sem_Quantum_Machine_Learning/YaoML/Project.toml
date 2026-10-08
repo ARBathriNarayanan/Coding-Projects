@@ -1,0 +1,4 @@
+[deps]
+LIBSVM = "b1bec4e5-fd48-53fe-b0cb-9723c09d164b"
+MLJLIBSVMInterface = "61c7150f-6c77-4bb1-949c-13197eac2a52"
+Yao = "5872b779-8223-5990-8dd0-5abbb0748c8c"
